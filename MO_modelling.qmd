@@ -1,0 +1,592 @@
+---
+title: "ML Mini Project"
+author: "Cian Loughlin"
+format: html
+editor: visual
+---
+
+```{r}
+packageurl <- "https://cran.r-project.org/src/contrib/Archive/Matrix/Matrix_1.6-5.tar.gz"
+install.packages(packageurl, repos=NULL, type="source")
+#install.packages("BiocManager")
+BiocManager::install(c("GenomicFeatures", "AnnotationDbi"))
+
+```
+
+```{r}
+# Install Bioconductor packages
+BiocManager::install("progeny")
+BiocManager::install("corrplot")  # if also missing
+BiocManager::install(c("clusterProfiler", "org.Hs.eg.db", "enrichplot"))
+
+# Install CRAN packages normally
+install.packages("glmpath")
+install.packages("glmnet")
+install.packages("penalized")
+install.packages("glmnetUtils")
+install.packages("randomForestSRC")
+install.packages("survivalsvm")
+install.packages("STRINGdb")
+BiocManager::install("survcomp")
+```
+
+```{r}
+BiocManager::install("STRINGdb")
+
+```
+
+```{r}
+library(survival)
+library(survminer)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(STRINGdb)
+library(progeny)
+library(corrplot)
+
+# glmnet
+library("glmpath")
+library("glmnet")
+library("penalized")
+library("glmnetUtils")
+# RF
+library("randomForestSRC")
+library("survcomp")
+```
+
+```{r}
+
+```
+
+### Load Clinical Data
+
+```{r}
+clin_raw <- read.delim("brca_tcga_pan_can_atlas_2018/data_clinical_patient.txt", sep = '\t',skip = 4)
+rownames(clin_raw) <- clin_raw$PATIENT_ID
+```
+
+### Load and Process RNA data
+
+```{r}
+RNA_raw <- read.delim("brca_tcga_pan_can_atlas_2018/data_mrna_seq_v2_rsem_zscores_ref_all_samples.txt",check.names = FALSE)
+RNA_raw[is.na(RNA_raw)] <- 0
+RNA_raw <- RNA_raw[RNA_raw$Hugo_Symbol!='',]
+RNA_raw <- RNA_raw[!duplicated(RNA_raw$Hugo_Symbol),]
+rownames(RNA_raw) <- RNA_raw$Hugo_Symbol
+RNA <- as.data.frame(t(RNA_raw[-1:-2]))
+```
+
+## Basal Subtype Filtering
+
+```{r}
+# Aligning clinical data}
+clin <- clin_raw[str_sub(row.names(RNA), end = -4),]
+
+# Identifying Basal pats 
+basal_ids <- rownames(clin)[clin$SUBTYPE == "BRCA_Basal"]
+
+#Subset RNA and clinical to basal
+basal_RNA <- RNA[rownames(RNA) %in%
+                   paste0(basal_ids, "-01"), ]
+basal_clin <- clin[clin$SUBTYPE == "BRCA_Basal", ]
+
+#No. of basal pats
+cat("No. of Basal Patients:", nrow(basal_clin), "\n")
+
+RNA <- basal_RNA
+clin <- basal_clin
+
+```
+
+## Load and Process CNA data
+
+```{r}
+CNA_raw <- read.delim("brca_tcga_pan_can_atlas_2018/data_cna.txt",check.names = FALSE)
+
+#cleaning
+CNA_raw <- CNA_raw[CNA_raw$Hugo_Symbol!='',]
+CNA_raw <- CNA_raw[!duplicated(CNA_raw$Hugo_Symbol),]
+rownames(CNA_raw) <- CNA_raw$Hugo_Symbol
+
+#transpose (r = pats, cols = genes)
+CNA <- as.data.frame(t(CNA_raw[ , -1:-2]))
+
+basal_CNA <- CNA[rownames(RNA), ]
+basal_CNA[is.na(basal_CNA)] <- 0
+
+cat("CNA matrix dimensions:", nrow(basal_CNA), "x", ncol(basal_CNA), "\n")
+```
+
+## Integrate RNA and CNA data
+
+```{r}
+#genes present in both datasets
+common_genes <- intersect(colnames(RNA), colnames(basal_CNA))
+cat("Common genes between RNA ad CNA:", length(common_genes), "\n")
+
+
+common_RNA <- RNA[ , common_genes]
+common_CNA <- basal_CNA[ , common_genes]
+
+#identifying amplified genes per pat (CNA +2 = high)
+amplification_freq <- colMeans(common_CNA == 2)
+
+#identifying highly expressed genes (mean z-score > 1 for basal pats)
+highly_exp <- colMeans(common_RNA) > 1
+
+#genes both frequently amplified (>10% pats) and highly expressed 
+integrated_genes <- names(amplification_freq)[amplification_freq > 0.10 & highly_exp]
+cat("Genes that are amplified and highly expressed for Basal subtype:", 
+    length(integrated_genes), "\n")
+print(integrated_genes)
+
+#visualisation
+amplification_df <- data.frame(
+  Gene = names(amplification_freq),
+  Amp_Frequency = amplification_freq
+) %>%
+  filter(Gene %in% integrated_genes) %>%
+  arrange(desc(Amp_Frequency))
+
+ggplot(amplification_df, aes(x = reorder(Gene, Amp_Frequency), y = Amp_Frequency)) + 
+  geom_bar(stat = 'identity', fill = 'firebrick') +
+  coord_flip() +
+  labs(title = 'Genes that are Amplified and Highly Expressed in Basal',
+       x = 'Gene', y = '% of patients with amplification')
+
+```
+
+## Create Survival Object
+
+```{r}
+# create a survival object consisting of times & censoring
+surv_obj <- Surv(time = clin$OS_MONTHS, 
+                 event = clin$OS_STATUS=="1:DECEASED")
+```
+
+## Overall SUrvival KM Curve
+
+```{r}
+#surv_obj 
+
+fit <- survfit(surv_obj ~ 1, data = clin)
+ggsurvplot(fit, data = clin, xlab = "Month", ylab = "Overall survival")
+```
+
+## Hazard Ratio KRAS and TP53
+
+```{r}
+# fit multivariate  COX proportional hazard model for some specific genes
+fit.coxph <- coxph(surv_obj ~ KRAS + TP53, 
+                   data = RNA)
+ggforest(fit.coxph, data = RNA)
+```
+
+## Progeny pathway scoring
+
+```{r}
+zscores = as.matrix(t(RNA))
+pathways <- progeny(zscores, scale=TRUE, organism="Human")  #, top = 100, perm = 1)
+path_df <- as.data.frame(pathways)
+
+# fit multivariate  COX proportional hazard model for some specific paythways
+fit.coxph <- coxph(surv_obj ~ MAPK + `JAK-STAT`, data = path_df)
+ggforest(fit.coxph, data = path_df)
+```
+
+### Pathway correlation plot
+
+```{r}
+corrplot(cor(path_df), type = "upper", order = "hclust",tl.col = "black", tl.srt = 45)
+```
+
+### MAPK Correlation Plot
+
+```{r}
+# analysing on what MAPK activity depend
+MAPK_df <- cbind(MAPK = path_df$MAPK, PI3K = path_df$PI3K,
+                KSR1 = RNA$KSR1, KSR2 = RNA$KSR2, IQGAP1 = RNA$IQGAP1, 
+                IQGAP2 = RNA$IQGAP2, IQGAP3 = RNA$IQGAP3, GAB1 = RNA$GAB1, GAB2 = RNA$GAB2,
+                KRAS = RNA$KRAS, NRAS = RNA$NRAS, HRAS = RNA$HRAS, BRAF=RNA$BRAF, 
+                CRAF=RNA$RAF1, ARAF=RNA$ARAF)
+corrplot(cor(MAPK_df), type = "upper", order = "hclust",tl.col = "black", tl.srt = 45)
+```
+
+### ilter zero survival times
+
+```{r}
+# now creating object without zero times
+clin_filt <- clin[clin$OS_MONTHS > 0,]
+RNA_filt <- RNA[clin$OS_MONTHS > 0,]
+path_filt <- path_df[clin$OS_MONTHS > 0,]
+# create a survival object consisting of times & censoring
+surv_filt <- Surv(time = clin_filt$OS_MONTHS, 
+                 event = clin_filt$OS_STATUS=="1:DECEASED")
+fit <- survfit(surv_filt ~ 1, data = clin_filt)
+ggsurvplot(fit, data = clin_filt, xlab = "Month", ylab = "Overall survival")
+```
+
+### Build multi-omics feature matrix
+
+```{r}
+CNA_filt <- basal_CNA[clin$OS_MONTHS > 0, ]
+CNA_filt[is.na(CNA_filt)] <- 0
+
+#keep only common genes
+common_filt <- intersect(colnames(RNA_filt), colnames(CNA_filt))
+
+#add prefix to tell apart
+RNA_for_model <- RNA_filt[ , common_filt]
+CNA_for_model <- CNA_filt[ , common_filt]
+colnames(CNA_for_model) <- paste0('CNA_', colnames(CNA_for_model))
+
+#combine into 1 matrix
+multi_omics_mat <- cbind(RNA_for_model, CNA_for_model)
+cat('Multi-omics feature matrix:',
+    nrow(multi_omics_mat), 'patients x',
+    ncol(multi_omics_mat), 'features\n')
+
+```
+
+### Finding Optimal Alpha
+
+```{r}
+# finding optimal alpha
+lena = 11
+cvafit <- cva.glmnet(as.matrix(RNA_filt),surv_filt,alpha=seq(0, 1, len = lena),nfolds=10,family="cox",type.measure = "C")
+```
+
+```{r}
+# plotting results of alpha scan
+cvafit$cvms <- NULL
+cvafit$cvss <- NULL
+for (i in 1:lena) {
+  cvafit$cvms <- c(cvafit$cvms, max(cvafit$modlist[[i]]$cvm))
+  cvafit$cvss <- c(cvafit$cvss, max(cvafit$modlist[[i]]$cvs))
+}
+plot(seq(0, 1, len = lena),cvafit$cvms,type = 'b',xlab='alpha',ylab='C-index',ylim=c(0.4,0.8))
+arrows(x0=seq(0, 1, len = lena), y0=cvafit$cvms-cvafit$cvss, x1=seq(0, 1, len = lena), y1=cvafit$cvms+cvafit$cvss, code=3, angle=90, length=0.1)
+```
+
+### Plotting Alpha C-index
+
+```{r}
+# chosing optimal alpha
+opt_i <- which.max(cvafit$cvms)
+opt_a <- cvafit$alpha[opt_i]
+# we can select alpha manually instead
+#opt_a <- 0.1
+```
+
+```{r}
+# CV glmnet
+cvfit <- cv.glmnet(as.matrix(RNA_filt),surv_filt,family="cox",type.measure = "C",alpha = opt_a)
+plot(cvfit)
+```
+
+### Plotting Lambda C-index
+
+```{r}
+# selecting optimal lambda
+opt_i <- which.max(cvfit$cvm)
+opt_l <- cvfit$lambda[opt_i]
+```
+
+```{r}
+# analysing results
+cfs = coef(cvfit,s=opt_l)
+meaning_coefs = rownames(cfs)[cfs[,1]!= 0]
+meaning_vals = cfs[cfs[,1]!=0,]
+write.csv(meaning_vals,file='survival_coeffs_cvglmnet_RNAseq.csv')
+print(paste(meaning_coefs,collapse=" + "))
+```
+
+```{r}
+
+# fit multivariate  COX proportional hazard model for some specific genes
+fit.coxph <- coxph(surv_filt ~ CXCL11 + RHO, data = RNA_filt)
+ggforest(fit.coxph, data = RNA_filt)
+```
+
+### Glmnet over PROGENy
+
+```{r}
+# glmnet over progeny
+fit_glm <- glmnet(path_filt,surv_filt,family="cox") # , alpha = 1, standardize = TRUE, maxit = 1000
+print(fit_glm)
+```
+
+```{r}
+# analysing results
+cfs = coef(fit_glm,s=0.02)
+meaning_coefs = rownames(cfs)[cfs[,1]!= 0]
+meaning_vals = cfs[cfs[,1]!=0,]
+write.csv(meaning_vals,file='survival_coeffs_progeny_glmnet.csv')
+print(paste(meaning_coefs,collapse=" + "))
+
+```
+
+### Optimal MPAK threshold
+
+```{r}
+# plotting Kaplan-Mayer curves
+pathway = 'MAPK'
+pathway_data = path_filt$MAPK
+# sort age 
+uni_path = sort(unique(pathway_data))
+# store results
+results_path = matrix(1,length(uni_path))
+# do a for loop for every unique value of age mat
+for (i in 2:(length(uni_path)-1)){ # Starting from 2 because the first element would yield no elements higher than.
+  path_i = 1*(pathway_data>uni_path[i])
+  # survdiff is the function from the survival package 
+  logrank = survdiff(surv_filt ~ path_i)
+  # store in results_age
+  results_path[i] = logrank$pvalue
+}
+# Plot unique elements of age against p-value
+plot(uni_path, results_path, log = 'y')
+```
+
+```{r}
+# Select minimum P-value
+min_p_path = which.min(results_path)
+# here are 2 good thresholds, -1 and 1
+opt_thr = uni_path[min_p_path]
+# I recalculated the P-value as a sanity check
+pval = survdiff(surv_filt ~ pathway_data>opt_thr)$pvalue
+nplus = sum(pathway_data>opt_thr)   # how many patients we have in high group
+nminus = sum(pathway_data<opt_thr)   # how many patients we have in low group
+```
+
+### Fitting MAPK km groups
+
+```{r}
+# fit Kaplan Meier model
+path_filt <- path_filt %>% mutate(MAPK_group = ifelse(MAPK >= 1, "high", ifelse(MAPK < 1.001*opt_thr,"low","intermediate")))
+nhigh = sum(pathway_data>1)
+ninter = sum((pathway_data<1) & (pathway_data > 1.001*opt_thr))
+nlow = sum(pathway_data<1.001*opt_thr)
+#KM = survfit(surv_filt ~ pathway_data>opt_thr,data = path_filt)
+KM = survfit(surv_filt ~ MAPK_group,data = path_filt)
+```
+
+### nPlotting MAPK KM curve
+
+```{r}
+# Plot Kaplan Meier 
+#plot(KM, lwd = 3, col = c(1,2), cex.axis = 1.5, xlab = 'Months', ylab = 'Survival Probability' , cex.lab = 1.5)
+#ggsurvplot(KM, data = path_filt,pval = TRUE,xlab = 'Overall survival time, months',
+#           legend.labs=c(paste('Low ',pathway,' activity, ',nminus,' patient(s)',sep = ''),paste('High ',pathway,' activity, ',nplus,' patient(s)',sep = '')),
+#           palette = c('blue','red'),legend.title="")
+p <- ggsurvplot(KM, data = path_filt,pval = TRUE,xlab = 'Overall survival time, months',
+           legend.labs=c(paste("High MAPK activity,\n",nhigh," patients",sep=""),paste("Low MAPK activity,\n",nlow," patients",sep="")),
+           legend.title=""
+           )
+
+ggpar(p, 
+      font.main = c(13, "bold"),
+      font.x = c(16, "bold"),
+      font.y = c(16, "bold"),
+      font.caption = c(16, "bold"), 
+      font.legend = c(13, "bold"), 
+      font.tickslab = c(14, "bold"))
+```
+
+### Multi-omics elastic net cox regression
+
+```{r}
+#glmnet on matrix
+cvfit_multi <- cv.glmnet(
+  as.matrix(multi_omics_mat),
+  surv_filt,
+  family = 'cox',
+  type.measure = 'C',
+  alpha = opt_a,
+  nfolds = 10
+)
+plot(cvfit_multi, main = 'Multi-omics Elastic Net (RNA + CNA)')
+
+#extracting selected features 
+opt_l_multi <- cvfit_multi$lambda[which.max(cvfit_multi$cvm)]
+cfs_multi <- coef(cvfit_multi, s = opt_l_multi)
+selected <- rownames(cfs_multi)[cfs_multi[, 1] != 0]
+cat('Selected multi-omics features:\n')
+print(selected)
+write.csv(cfs_multi[cfs_multi[,1] != 0, ],
+          file = 'survival_coefficients_multiomics.csv')
+```
+
+### Extracting top risk and protective genes
+
+```{r}
+coeff_df <- read.csv('survival_coefficients_multiomics.csv', row.names= 1)
+colnames(coeff_df) <- 'coefficient'
+
+#keep only rna genes 
+coeff_rna <- coeff_df[!grepl('^CNA_', rownames(coeff_df)), , drop= FALSE]
+
+#sorting by value of coeff
+coeff_rna <- coeff_rna[order(coeff_rna$coefficient), , drop=FALSE]
+
+#most positive coeffs = worse survival (top risk genes)
+top_risk <- tail(rownames(coeff_rna), 20)
+
+#most negative coeffs = better survival (top protective)
+top_protective <- head(rownames(coeff_rna), 20)
+
+cat('Top Risk Genes (pos coeffs):\n')
+print(top_risk)
+
+cat('Top Protective Genes (neg coeffs):\n')
+print(top_protective)
+
+write.csv(data.frame(gene = top_risk),
+          file = 'genes_risk.csv', row.names = FALSE)
+write.csv(data.frame(gene = top_protective),
+          file = 'genes_protective.csv', row.names = FALSE)
+```
+
+### KEGG - Protective and RIsk
+
+```{r}
+#convert gene symbols to entrez ids for kegg
+risk_entrez <- bitr(top_risk,
+                    fromType = 'SYMBOL',
+                    toType = 'ENTREZID',
+                    OrgDb = org.Hs.eg.db)
+
+protective_entrez <- bitr(top_protective,
+                    fromType = 'SYMBOL',
+                    toType = 'ENTREZID',
+                    OrgDb = org.Hs.eg.db)
+
+#KEGG - risk
+kegg_risk <- enrichKEGG(gene = risk_entrez$ENTREZID,
+                        organism = 'hsa',
+                        pvalueCutoff = 0.2,
+                        qvalueCutoff = 0.5,
+                        use_internal_data = TRUE)
+
+#KEGG - protective
+kegg_protective <- enrichKEGG(gene = protective_entrez$ENTREZID,
+                        organism = 'hsa',
+                        pvalueCutoff = 0.2,
+                        qvalueCutoff = 0.5,
+                        use_internal_data = TRUE)
+
+#plotting
+dotplot(kegg_risk, title = 'KEGG Pathway Enrichment for #Risk Genes')
+dotplot(kegg_protective, title = 'KEGG Pathway Enrichment for Protective Genes')
+```
+
+### STRINGdb (use string db website instead)
+
+```{r}
+#intialising string db
+string_db <- STRINGdb$new(version = '11.5',
+                          species = 9606,
+                          score_threshold = 400,
+                          network_type = 'full')
+
+#mappingtop genes to string ids
+top_genes_all <- data.frame(gene = c(top_risk, top_protective))
+mapped <- string_db$map(top_genes_all, 'gene', removeUnmappedRows = TRUE)
+
+#plotting the network
+# - each node is a protein, each edge is a predicted or known interaction
+string_db$plot_network(mapped$STRING_id)
+
+#saving interactions 
+interactions <- string_db$get_interactions(mapped$STRING_id)
+write.csv(interactions, file = 'string_interactions.csv', row.names = FALSE)
+cat('No. of protein Interactions found:', nrow(interactions), '\n')
+```
+
+### Building RF model
+
+```{r}
+# building RF model
+B <- 1000
+# Building a RSF
+status_surv <- clin_filt$OS_STATUS=="1:DECEASED"
+time_surv <- clin_filt$OS_MONTHS
+dataSetRF <- cbind(time_surv,status_surv,RNA_filt)
+
+names(dataSetRF)<-make.names(names(dataSetRF))
+
+RF_obj <- rfsrc(Surv(time_surv,status_surv)~., dataSetRF,  ntree = B,  membership = TRUE, importance=TRUE)
+```
+
+```{r}
+# Printing the RF object  
+print(RF_obj)
+
+pred.RF <- predict(object = RF_obj, newdata = dataSetRF) #, subset = test.index)
+```
+
+This could take a few hoursS
+
+### Variable Importance
+
+```{r}
+# Variable importance
+jk.obj <- subsample(RF_obj)
+pdf("VIMPsur.pdf", width = 15, height = 20)
+par(oma = c(0.5, 10, 0.5, 0.5))
+par(cex.axis = 2.0, cex.lab = 2.0, cex.main = 2.0, mar = c(6.0,17,1,1), mgp = c(4, 1, 0))
+plot(jk.obj, xlab = "Variable Importance (x 100)", cex = 1.2)
+plot(jk.obj)
+dev.off()
+```
+
+### RF slected genes hazard
+
+```{r}
+fit.coxph <- coxph(surv_filt ~ TRIM67 + RASA1 + RHOF + NCAPD3 + NEU2 + ARNTL2 + CDK6, data = RNA_filt)
+ggforest(fit.coxph, data = RNA_filt)
+```
+
+comparison
+
+### Comaprison of Subtypes
+
+```{r}
+#unfiltered data for plot
+clin_all <- clin_raw[str_sub(colnames(RNA_raw)[-(1:2)], end = -4), ]
+
+#keep only pats with valid survival data
+clin_all <- clin_all[clin_all$OS_MONTHS > 0 &
+                       !is.na(clin_all$SUBTYPE) & 
+                       clin_all$SUBTYPE != '', ]
+
+surv_all <- Surv(time = clin_all$OS_MONTHS,
+                 event = clin_all$OS_STATUS == '1:DECEASED')
+
+km_subtype <- survfit(surv_all ~ SUBTYPE, data = clin_all)
+
+ggsurvplot(km_subtype,
+           data = clin_all,
+           pval = TRUE,
+           legend.title = 'Subtype',
+           xlab = 'Overall Survival in Months',
+           ylab = 'Survival Probability',
+           title = 'Survival by BRCA Subtype (Full Cohort)',
+           ggtheme = theme_minimal())
+
+```
+
+### RF C-ndex
+
+```{r}
+# testing accuracy
+#BiocManager::install("survcomp")
+#library("survcomp")
+
+cindex <- concordance.index(pred.RF$predicted, surv.time = time_surv, surv.event = status_surv)
+cindex$c.index
+```
